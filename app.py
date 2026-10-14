@@ -1,113 +1,201 @@
 from pathlib import Path
-import io
-import matplotlib.pyplot as plt
+import warnings
+
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, classification_report,
+    confusion_matrix, f1_score
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-st.set_page_config(page_title="Manufacturing Efficiency AI", page_icon="🏭", layout="wide")
-ROOT=Path(__file__).resolve().parent
-TARGET="Efficiency_Status"
-CAT=["Machine_ID","Operation_Mode"]
-NUM=["Temperature_C","Vibration_Hz","Power_Consumption_kW","Network_Latency_ms","Packet_Loss_%","Quality_Control_Defect_Rate_%","Predictive_Maintenance_Score"]
-FEATURES=CAT+NUM
+warnings.filterwarnings("ignore", category=UserWarning)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "data" / "Thales_Group_Manufacturing.csv"
+TARGET = "Efficiency_Status"
 
-st.title("🏭 Manufacturing Efficiency AI")
-st.caption("Classify manufacturing efficiency from machine and sensor readings.")
-with st.sidebar:
-    st.header("Data")
-    upload=st.file_uploader("Upload your manufacturing CSV (optional)", type=["csv"])
-    page=st.radio("Page",["Overview","Model performance","Predict efficiency","Explore data"])
+st.set_page_config(
+    page_title="Manufacturing Efficiency AI",
+    page_icon="🏭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 @st.cache_data
-def demo_data():
-    return pd.read_csv(ROOT/"data"/"manufacturing_demo.csv")
-
-try:
-    raw=pd.read_csv(io.BytesIO(upload.getvalue())) if upload else demo_data()
-    missing=[c for c in FEATURES+[TARGET] if c not in raw.columns]
-    if missing:
-        st.error("Missing required columns: "+", ".join(missing)); st.stop()
-    data=raw[FEATURES+[TARGET]].copy()
-    for c in NUM: data[c]=pd.to_numeric(data[c],errors="coerce")
-    data[TARGET]=data[TARGET].astype(str).str.strip().str.title()
-    data=data.dropna()
-    data=data[data[TARGET].isin(["High","Medium","Low"])]
-    if len(data)<30 or data[TARGET].nunique()<2:
-        st.error("Please provide at least 30 complete rows and at least two target classes."); st.stop()
-except Exception as e:
-    st.error(f"Could not read dataset: {e}"); st.stop()
+def load_data():
+    df = pd.read_csv(DATA_PATH)
+    if TARGET not in df.columns:
+        raise ValueError(f"Required target column '{TARGET}' was not found.")
+    return df
 
 @st.cache_resource
-def fit_model(frame):
-    X=frame[FEATURES]; y=frame[TARGET]
-    strat=y if y.value_counts().min()>=2 else None
-    Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.2,random_state=42,stratify=strat)
-    prep=ColumnTransformer([("categorical",OneHotEncoder(handle_unknown="ignore"),CAT),("numeric","passthrough",NUM)])
-    model=Pipeline([("prep",prep),("rf",RandomForestClassifier(n_estimators=140,random_state=42,class_weight="balanced",n_jobs=-1,min_samples_leaf=2))])
-    model.fit(Xtr,ytr); pred=model.predict(Xte)
-    return model,yte,pred,accuracy_score(yte,pred)
-model,y_test,y_pred,acc=fit_model(data)
+def train_model(df):
+    # Keep the target and input columns explicit; exclude Error_Rate_% because
+    # it may be mechanically related to the target-generation process.
+    cat_candidates = ["Machine_ID", "Operation_Mode"]
+    num_candidates = [
+        "Temperature_C", "Vibration_Hz", "Power_Consumption_kW",
+        "Network_Latency_ms", "Packet_Loss_%",
+        "Quality_Control_Defect_Rate_%",
+        "Production_Speed_units_per_hr", "Predictive_Maintenance_Score",
+    ]
+    cat = [c for c in cat_candidates if c in df.columns]
+    num = [c for c in num_candidates if c in df.columns]
+    features = cat + num
+    clean = df[features + [TARGET]].dropna().copy()
+    X, y = clean[features], clean[TARGET].astype(str)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y
+    )
+    transformers = []
+    if cat:
+        transformers.append(("categorical", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        transformers.append(("numeric", "passthrough", num))
+    prep = ColumnTransformer(transformers=transformers)
+    model = Pipeline([
+        ("prep", prep),
+        ("rf", RandomForestClassifier(
+            n_estimators=160, random_state=42, class_weight="balanced",
+            n_jobs=-1, min_samples_leaf=2
+        ))
+    ])
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+    metrics = {
+        "features": features, "categorical": cat, "numeric": num,
+        "X_test": X_test, "y_test": y_test, "predictions": pred,
+        "accuracy": accuracy_score(y_test, pred),
+        "balanced_accuracy": balanced_accuracy_score(y_test, pred),
+        "macro_f1": f1_score(y_test, pred, average="macro", zero_division=0),
+        "report": classification_report(y_test, pred, output_dict=True, zero_division=0),
+        "labels": sorted(y.unique()),
+        "confusion": confusion_matrix(y_test, pred, labels=sorted(y.unique())),
+    }
+    return model, metrics
 
-if page=="Overview":
-    a,b,c,d=st.columns(4)
-    a.metric("Records",f"{len(data):,}"); b.metric("Machines",data.Machine_ID.nunique())
-    c.metric("Test accuracy",f"{acc:.1%}"); d.metric("Classes",data[TARGET].nunique())
-    left,right=st.columns(2)
+st.title("🏭 Manufacturing Efficiency AI")
+st.caption("Sensor, production, quality and network analytics for smart manufacturing")
+try:
+    df = load_data()
+    model, metrics = train_model(df)
+except Exception as exc:
+    st.error(f"The dataset or model could not be loaded: {exc}")
+    st.stop()
+
+with st.sidebar:
+    st.header("Navigation")
+    page = st.radio(
+        "Choose a page",
+        ["Overview", "Model performance", "Predict efficiency", "Explore data"],
+        label_visibility="collapsed",
+    )
+    st.divider()
+    st.caption("Dataset: Thales Group Manufacturing CSV")
+    st.caption(f"{len(df):,} records · {len(df.columns)} columns")
+
+if page == "Overview":
+    st.subheader("Manufacturing overview")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total records", f"{len(df):,}")
+    c2.metric("Machines", f"{df['Machine_ID'].nunique():,}" if "Machine_ID" in df else "N/A")
+    c3.metric("Efficiency classes", f"{df[TARGET].nunique()}")
+    c4.metric("Balanced accuracy", f"{metrics['balanced_accuracy']:.1%}")
+    left, right = st.columns(2)
     with left:
-        st.subheader("Efficiency status distribution")
-        counts=data[TARGET].value_counts().reindex(["High","Medium","Low"]).dropna()
-        fig,ax=plt.subplots(); counts.plot(kind="bar",ax=ax); ax.set_xlabel("Status"); ax.set_ylabel("Records"); ax.tick_params(axis="x",rotation=0); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+        counts = df[TARGET].astype(str).value_counts().rename_axis("Efficiency status").reset_index(name="Records")
+        st.plotly_chart(px.bar(counts, x="Efficiency status", y="Records", title="Efficiency status distribution",
+                               color="Efficiency status"), use_container_width=True)
     with right:
-        st.subheader("Sensor readings by status")
-        sensor=st.selectbox("Sensor",NUM)
-        fig,ax=plt.subplots()
-        for label in ["High","Medium","Low"]:
-            vals=data.loc[data[TARGET]==label,sensor]
-            if len(vals): ax.hist(vals,bins=24,alpha=.5,label=label)
-        ax.set_xlabel(sensor); ax.set_ylabel("Records"); ax.legend(); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
-    st.info("The included CSV is synthetic demo data. Upload an approved real dataset before reporting results as real-world performance.")
-elif page=="Model performance":
-    st.metric("Held-out test accuracy",f"{acc:.2%}")
-    labels=["High","Medium","Low"]
-    cm=confusion_matrix(y_test,y_pred,labels=labels)
-    fig,ax=plt.subplots(); im=ax.imshow(cm); ax.set_xticks(range(3),labels); ax.set_yticks(range(3),labels); ax.set_xlabel("Predicted"); ax.set_ylabel("Actual"); ax.set_title("Confusion matrix")
-    for i in range(3):
-        for j in range(3): ax.text(j,i,str(cm[i,j]),ha="center",va="center")
-    fig.colorbar(im,ax=ax); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+        if "Operation_Mode" in df:
+            mode_counts = df["Operation_Mode"].astype(str).value_counts().rename_axis("Operation mode").reset_index(name="Records")
+            st.plotly_chart(px.bar(mode_counts, x="Operation mode", y="Records", title="Operation mode distribution"),
+                            use_container_width=True)
+        elif "Machine_ID" in df:
+            machine_counts = df["Machine_ID"].astype(str).value_counts().head(15).rename_axis("Machine").reset_index(name="Records")
+            st.plotly_chart(px.bar(machine_counts, x="Machine", y="Records", title="Records by machine"), use_container_width=True)
+    st.subheader("Dataset preview")
+    st.dataframe(df.head(10), use_container_width=True, hide_index=True)
+    st.info("The dataset contains network measurements such as latency and packet loss. These are used as network-performance indicators; this dashboard does not connect to or operate a real 6G network.")
+
+elif page == "Model performance":
+    st.subheader("Model performance")
+    st.caption("Random Forest classifier · stratified 80/20 train/test split · class-weighted training")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Accuracy", f"{metrics['accuracy']:.1%}")
+    c2.metric("Balanced accuracy", f"{metrics['balanced_accuracy']:.1%}")
+    c3.metric("Macro F1-score", f"{metrics['macro_f1']:.1%}")
+    st.write("Balanced accuracy and macro F1 help show performance across all classes when class counts differ.")
+    labels = metrics["labels"]
+    cm_df = pd.DataFrame(metrics["confusion"], index=[f"Actual {x}" for x in labels],
+                         columns=[f"Predicted {x}" for x in labels])
+    st.plotly_chart(px.imshow(cm_df, text_auto=True, aspect="auto", title="Confusion matrix",
+                              labels=dict(x="Predicted class", y="Actual class", color="Count")),
+                    use_container_width=True)
+    report_df = pd.DataFrame(metrics["report"]).T
     st.subheader("Classification report")
-    st.dataframe(pd.DataFrame(classification_report(y_test,y_pred,labels=labels,output_dict=True,zero_division=0)).transpose().round(3),use_container_width=True)
-elif page=="Predict efficiency":
-    st.subheader("Try a machine reading")
-    with st.form("predict"):
-        a,b,c=st.columns(3)
-        machine=a.selectbox("Machine ID",sorted(data.Machine_ID.astype(str).unique()))
-        mode=b.selectbox("Operation mode",sorted(data.Operation_Mode.astype(str).unique()))
-        temp=a.number_input("Temperature (°C)",0.0,200.0,float(data.Temperature_C.median()))
-        vib=b.number_input("Vibration (Hz)",0.0,100.0,float(data.Vibration_Hz.median()))
-        power=c.number_input("Power (kW)",0.0,500.0,float(data.Power_Consumption_kW.median()))
-        lat=a.number_input("Network latency (ms)",0.0,1000.0,float(data.Network_Latency_ms.median()))
-        loss=b.number_input("Packet loss (%)",0.0,100.0,float(data["Packet_Loss_%"].median()))
-        defect=c.number_input("Defect rate (%)",0.0,100.0,float(data["Quality_Control_Defect_Rate_%"].median()))
-        maint=st.slider("Predictive maintenance score",0.0,100.0,float(data.Predictive_Maintenance_Score.median()))
-        submit=st.form_submit_button("Predict efficiency",type="primary")
-    if submit:
-        row=pd.DataFrame([{"Machine_ID":machine,"Operation_Mode":mode,"Temperature_C":temp,"Vibration_Hz":vib,"Power_Consumption_kW":power,"Network_Latency_ms":lat,"Packet_Loss_%":loss,"Quality_Control_Defect_Rate_%":defect,"Predictive_Maintenance_Score":maint}],columns=FEATURES)
-        pred=model.predict(row)[0]; probs=model.predict_proba(row)[0]
-        st.success(f"Predicted efficiency status: **{pred}**")
-        st.bar_chart(pd.DataFrame({"Probability":probs},index=model.named_steps["rf"].classes_))
-        st.caption("Predictions are estimates for educational demonstration, not safety-critical decisions.")
-else:
-    st.subheader("Explore data")
-    st.write(f"{len(data):,} rows × {len(data.columns)} columns")
-    term=st.text_input("Filter by machine ID")
-    view=data if not term else data[data.Machine_ID.astype(str).str.contains(term,case=False,na=False)]
-    st.dataframe(view.head(500),use_container_width=True)
-    st.download_button("Download filtered CSV",view.to_csv(index=False).encode(), "manufacturing_data.csv","text/csv")
-st.divider()
-st.caption("Manufacturing Efficiency AI • Educational machine-learning project")
+    st.dataframe(report_df.round(3), use_container_width=True)
+    st.subheader("Features used")
+    st.write(", ".join(metrics["features"]))
+    st.warning("Error_Rate_%, Date and Timestamp are excluded to reduce possible target leakage or timestamp-only signals. The target-generation method should be verified before making real-world performance claims.")
+
+elif page == "Predict efficiency":
+    st.subheader("Predict efficiency")
+    st.write("Enter values below to estimate an efficiency class using the model trained on the uploaded dataset.")
+    with st.form("prediction_form"):
+        values = {}
+        cols = st.columns(2)
+        for i, col in enumerate(metrics["features"]):
+            with cols[i % 2]:
+                if col in metrics["categorical"]:
+                    options = sorted(df[col].dropna().astype(str).unique().tolist())
+                    values[col] = st.selectbox(col.replace("_", " "), options=options)
+                else:
+                    series = pd.to_numeric(df[col], errors="coerce").dropna()
+                    low, high = float(series.min()), float(series.max())
+                    default = float(series.median())
+                    values[col] = st.number_input(
+                        col.replace("_", " "), min_value=low, max_value=high,
+                        value=min(max(default, low), high), format="%.4f"
+                    )
+        submitted = st.form_submit_button("Predict efficiency", type="primary")
+    if submitted:
+        row = pd.DataFrame([{c: values[c] for c in metrics["features"]}])
+        prediction = model.predict(row)[0]
+        st.success(f"Predicted efficiency status: **{prediction}**")
+        if hasattr(model, "predict_proba"):
+            probs = model.predict_proba(row)[0]
+            prob_df = pd.DataFrame({"Class": model.classes_, "Probability": probs})
+            st.plotly_chart(px.bar(prob_df, x="Class", y="Probability", range_y=[0, 1],
+                                   title="Model class probabilities"), use_container_width=True)
+        st.caption("This is a model estimate for demonstration, not a certified industrial control or safety decision.")
+
+elif page == "Explore data":
+    st.subheader("Explore dataset")
+    filtered = df.copy()
+    if TARGET in filtered:
+        classes = sorted(filtered[TARGET].dropna().astype(str).unique())
+        chosen = st.multiselect("Filter efficiency status", classes, default=classes)
+        filtered = filtered[filtered[TARGET].astype(str).isin(chosen)]
+    if "Machine_ID" in filtered:
+        machines = sorted(filtered["Machine_ID"].dropna().astype(str).unique())
+        selected_machines = st.multiselect("Filter machine", machines, default=machines)
+        filtered = filtered[filtered["Machine_ID"].astype(str).isin(selected_machines)]
+    st.caption(f"Showing {len(filtered):,} of {len(df):,} records")
+    st.dataframe(filtered, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download filtered data as CSV",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="manufacturing_filtered_data.csv",
+        mime="text/csv",
+    )
+    numeric_columns = [c for c in filtered.select_dtypes(include="number").columns if c != TARGET]
+    if numeric_columns:
+        chosen_col = st.selectbox("Choose a numeric column to inspect", numeric_columns)
+        st.plotly_chart(px.histogram(filtered, x=chosen_col, title=f"Distribution of {chosen_col}"),
+                        use_container_width=True)
